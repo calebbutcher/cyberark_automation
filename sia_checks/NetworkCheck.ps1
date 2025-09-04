@@ -6,6 +6,7 @@
 .DESCRIPTION
     This script tests connectivity to AWS S3, CyberArk Cloud, and AWS IoT endpoints
     while detecting potential packet inspection, encryption, or termination by third parties.
+    Enhanced with proper service-level validation for all endpoint types.
 .PARAMETER ConfigPath
     Path to the JSON configuration file (default: config.json)
 .PARAMETER LogPath
@@ -69,6 +70,175 @@ function Test-TCPConnection {
     catch {
         return $false
     }
+}
+
+# Function to test actual HTTPS connectivity with service validation
+function Test-HTTPSConnectivity {
+    param(
+        [string]$Hostname,
+        [string]$EndpointType = "Generic",
+        [int]$TimeoutSeconds = 15
+    )
+    
+    $result = @{
+        HTTPSConnectivity = $false
+        SSLHandshake = $false
+        ServiceReachable = $false
+        StatusCode = $null
+        FailureReason = ""
+        ResponseDetails = ""
+    }
+    
+    # Step 1: Test SSL/TLS handshake
+    try {
+        $tcpClient = New-Object System.Net.Sockets.TcpClient
+        $tcpClient.ReceiveTimeout = $TimeoutSeconds * 1000
+        $tcpClient.SendTimeout = $TimeoutSeconds * 1000
+        $tcpClient.Connect($Hostname, 443)
+        
+        $sslStream = New-Object System.Net.Security.SslStream($tcpClient.GetStream())
+        $sslStream.ReadTimeout = $TimeoutSeconds * 1000
+        $sslStream.WriteTimeout = $TimeoutSeconds * 1000
+        
+        $sslStream.AuthenticateAsClient($Hostname)
+        $result.SSLHandshake = $true
+        Write-LogMessage "SSL handshake successful for $Hostname" "INFO"
+        
+        $sslStream.Close()
+        $tcpClient.Close()
+    }
+    catch {
+        $result.FailureReason = "SSL handshake failed: $($_.Exception.Message)"
+        Write-LogMessage "SSL handshake failed for $Hostname`: $($_.Exception.Message)" "WARN"
+        return $result
+    }
+    
+    # Step 2: Test actual HTTPS request
+    try {
+        $webRequest = [System.Net.WebRequest]::Create("https://$Hostname")
+        $webRequest.Timeout = $TimeoutSeconds * 1000
+        $webRequest.UserAgent = "SIA-Network-Check/1.0"
+        
+        # Configure SSL/TLS settings
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
+        
+        # Set appropriate HTTP method based on endpoint type
+        switch ($EndpointType) {
+            "S3" { 
+                $webRequest.Method = "HEAD"  # S3 supports HEAD requests
+            }
+            "CyberArk" { 
+                $webRequest.Method = "GET"   # CyberArk endpoints expect GET
+            }
+            "IoT" { 
+                $webRequest.Method = "GET"   # IoT endpoints expect GET
+            }
+            default { 
+                $webRequest.Method = "HEAD"  # Default to HEAD for minimal impact
+            }
+        }
+        
+        try {
+            $response = $webRequest.GetResponse()
+            $result.HTTPSConnectivity = $true
+            $result.StatusCode = $response.StatusCode
+            $result.ResponseDetails = "HTTP Status: $($response.StatusCode)"
+            
+            # Validate response based on endpoint type
+            switch ($EndpointType) {
+                "S3" {
+                    # S3 should return 200 OK for valid HEAD requests to root
+                    # or may return other valid HTTP status codes
+                    if ($response.StatusCode -eq [System.Net.HttpStatusCode]::OK -or 
+                        $response.StatusCode -eq [System.Net.HttpStatusCode]::Forbidden -or
+                        $response.StatusCode -eq [System.Net.HttpStatusCode]::NotFound) {
+                        $result.ServiceReachable = $true
+                        Write-LogMessage "S3 endpoint reachable: $Hostname (Status: $($response.StatusCode))" "PASS"
+                    }
+                }
+                "CyberArk" {
+                    # CyberArk should return valid HTTP response
+                    if ($response.StatusCode -eq [System.Net.HttpStatusCode]::OK -or
+                        $response.StatusCode -eq [System.Net.HttpStatusCode]::Unauthorized -or
+                        $response.StatusCode -eq [System.Net.HttpStatusCode]::Forbidden) {
+                        $result.ServiceReachable = $true
+                        Write-LogMessage "CyberArk endpoint reachable: $Hostname (Status: $($response.StatusCode))" "PASS"
+                    }
+                }
+                "IoT" {
+                    # AWS IoT commonly returns 403 for unauthenticated requests - this is expected
+                    if ($response.StatusCode -eq [System.Net.HttpStatusCode]::OK -or 
+                        $response.StatusCode -eq [System.Net.HttpStatusCode]::Forbidden) {
+                        $result.ServiceReachable = $true
+                        Write-LogMessage "IoT endpoint reachable: $Hostname (Status: $($response.StatusCode))" "PASS"
+                    }
+                }
+                default {
+                    if ($response.StatusCode -eq [System.Net.HttpStatusCode]::OK) {
+                        $result.ServiceReachable = $true
+                        Write-LogMessage "Endpoint reachable: $Hostname (Status: $($response.StatusCode))" "PASS"
+                    }
+                }
+            }
+            
+            $response.Close()
+        }
+        catch [System.Net.WebException] {
+            $webResponse = $_.Exception.Response
+            if ($webResponse) {
+                $statusCode = $webResponse.StatusCode
+                $result.HTTPSConnectivity = $true  # We got a response, even if error
+                $result.StatusCode = $statusCode
+                $result.ResponseDetails = "HTTP Status: $statusCode"
+                
+                # Many services return error codes for unauthenticated requests - this is often expected
+                switch ($EndpointType) {
+                    "S3" {
+                        if ($statusCode -eq [System.Net.HttpStatusCode]::Forbidden -or
+                            $statusCode -eq [System.Net.HttpStatusCode]::NotFound -or
+                            $statusCode -eq [System.Net.HttpStatusCode]::BadRequest) {
+                            $result.ServiceReachable = $true
+                            Write-LogMessage "S3 endpoint reachable: $Hostname (Status: $statusCode - expected)" "PASS"
+                        }
+                    }
+                    "CyberArk" {
+                        if ($statusCode -eq [System.Net.HttpStatusCode]::Unauthorized -or
+                            $statusCode -eq [System.Net.HttpStatusCode]::Forbidden -or
+                            $statusCode -eq [System.Net.HttpStatusCode]::NotFound) {
+                            $result.ServiceReachable = $true
+                            Write-LogMessage "CyberArk endpoint reachable: $Hostname (Status: $statusCode - expected)" "PASS"
+                        }
+                    }
+                    "IoT" {
+                        if ($statusCode -eq [System.Net.HttpStatusCode]::Forbidden -or
+                            $statusCode -eq [System.Net.HttpStatusCode]::Unauthorized -or
+                            $statusCode -eq [System.Net.HttpStatusCode]::BadRequest) {
+                            $result.ServiceReachable = $true
+                            Write-LogMessage "IoT endpoint reachable: $Hostname (Status: $statusCode - expected)" "PASS"
+                        }
+                    }
+                }
+                
+                if (-not $result.ServiceReachable) {
+                    $result.FailureReason = "Unexpected HTTP response: $statusCode"
+                    Write-LogMessage "Unexpected HTTP response from $Hostname`: $statusCode" "WARN"
+                }
+                
+                $webResponse.Close()
+            }
+            else {
+                $result.FailureReason = "HTTPS request failed: $($_.Exception.Message)"
+                Write-LogMessage "HTTPS request failed for $Hostname`: $($_.Exception.Message)" "FAIL"
+            }
+        }
+    }
+    catch {
+        $result.FailureReason = "HTTPS connectivity test failed: $($_.Exception.Message)"
+        Write-LogMessage "HTTPS connectivity test failed for $Hostname`: $($_.Exception.Message)" "FAIL"
+    }
+    
+    return $result
 }
 
 # Function to detect packet inspection through multiple methods
@@ -137,7 +307,7 @@ function Test-PacketInspection {
             }
         }
         
-        # Method 2: HTTP Header Analysis - Check for inspection tool headers (improved)
+        # Method 2: HTTP Header Analysis - Check for inspection tool headers
         Write-LogMessage "Analyzing HTTP headers for $Hostname" "INFO"
         try {
             $headers = @{}
@@ -161,7 +331,7 @@ function Test-PacketInspection {
                 }
             }
             
-            # Check for known inspection tool headers (more specific to avoid false positives)
+            # Check for known inspection tool headers
             $inspectionHeaders = @{
                 "X-Zscaler-" = "Zscaler"
                 "X-BlueCoat-" = "BlueCoat"
@@ -174,31 +344,14 @@ function Test-PacketInspection {
                 "X-Check-Point-" = "Check Point"
                 "X-Websense-" = "Websense"
                 "X-Cisco-" = "Cisco"
-                "X-Proxy-Connection" = "Generic Proxy"
-                "X-Corporate-" = "Corporate Proxy"
+                "X-Proxy-" = "Generic Proxy"
+                "X-Forwarded-" = "Proxy/Load Balancer"
+                "Via" = "Proxy"
             }
             
             foreach ($header in $headers.AllKeys) {
                 foreach ($pattern in $inspectionHeaders.Keys) {
                     if ($header -match $pattern) {
-                        # Special check for Via headers - ignore legitimate CDNs
-                        if ($header -eq "Via") {
-                            $viaValue = $headers[$header]
-                            if ($viaValue -match "(cloudfront|cloudflare|fastly|akamai)") {
-                                Write-LogMessage "Legitimate CDN Via header detected: $viaValue" "INFO"
-                                continue
-                            }
-                        }
-                        
-                        # Special check for X-Forwarded headers from legitimate sources
-                        if ($header -match "X-Forwarded-") {
-                            $forwardedValue = $headers[$header]
-                            if ($forwardedValue -match "(aws|amazon|cloudfront)") {
-                                Write-LogMessage "Legitimate load balancer header detected: $header" "INFO"
-                                continue
-                            }
-                        }
-                        
                         $inspectionResult.SuspiciousHeaders = $true
                         $inspectionResult.NetworkInterception = $true
                         $inspectionResult.InspectionTool = $inspectionHeaders[$pattern]
@@ -289,7 +442,7 @@ function Test-PacketInspection {
     return $inspectionResult
 }
 
-# Function to get SSL certificate information (simplified)
+# Function to get SSL certificate information
 function Get-SSLCertificate {
     param(
         [string]$Hostname,
@@ -323,26 +476,51 @@ function Get-SSLCertificate {
     }
 }
 
-# Function to test endpoint with enhanced packet inspection detection
+# Function to determine endpoint type based on hostname
+function Get-EndpointType {
+    param([string]$Hostname)
+    
+    if ($Hostname -match '\.iot\..+\.amazonaws\.com$') {
+        return "IoT"
+    }
+    elseif ($Hostname -match 's3.*\.amazonaws\.com$') {
+        return "S3"
+    }
+    elseif ($Hostname -match '\.cyberark\.cloud$') {
+        return "CyberArk"
+    }
+    else {
+        return "Generic"
+    }
+}
+
+# Enhanced function to test endpoint with proper service-level validation
 function Test-NetworkEndpoint {
     param(
         [string]$Url
     )
     
     $hostname = ([System.Uri]$Url).Host
+    $endpointType = Get-EndpointType -Hostname $hostname
+    
     $result = @{
         Endpoint = $Url
+        EndpointType = $endpointType
         TCPConnectivity = $false
+        HTTPSConnectivity = $false
+        SSLHandshake = $false
+        ServiceReachable = $false
         PacketInspectionDetected = $false
         InspectionTool = "None"
         Status = "FAIL"
         FailureReason = ""
+        StatusCode = $null
         InspectionDetails = @()
     }
     
-    Write-LogMessage "Testing endpoint: $Url" "INFO"
+    Write-LogMessage "Testing $endpointType endpoint: $Url" "INFO"
     
-    # Test TCP connectivity using Test-NetConnection (more reliable)
+    # Step 1: Test TCP connectivity
     try {
         $tcpTest = Test-NetConnection -ComputerName $hostname -Port 443 -InformationLevel Quiet -WarningAction SilentlyContinue
         $result.TCPConnectivity = $tcpTest
@@ -360,7 +538,30 @@ function Test-NetworkEndpoint {
     
     Write-LogMessage "TCP connectivity successful for $hostname" "PASS"
     
-    # Perform comprehensive packet inspection detection
+    # Step 2: Test HTTPS connectivity with service validation
+    $httpsResult = Test-HTTPSConnectivity -Hostname $hostname -EndpointType $endpointType
+    $result.HTTPSConnectivity = $httpsResult.HTTPSConnectivity
+    $result.SSLHandshake = $httpsResult.SSLHandshake
+    $result.ServiceReachable = $httpsResult.ServiceReachable
+    $result.StatusCode = $httpsResult.StatusCode
+    
+    if (-not $result.SSLHandshake) {
+        $result.FailureReason = $httpsResult.FailureReason
+        Write-LogMessage "SSL handshake failed for $hostname" "FAIL"
+        return $result
+    }
+    
+    if (-not $result.ServiceReachable) {
+        if ($httpsResult.FailureReason) {
+            $result.FailureReason = $httpsResult.FailureReason
+        } else {
+            $result.FailureReason = "Service not responding correctly (Status: $($httpsResult.StatusCode))"
+        }
+        Write-LogMessage "Service validation failed for $hostname" "FAIL"
+        return $result
+    }
+    
+    # Step 3: Perform packet inspection detection
     $inspectionResult = Test-PacketInspection -Hostname $hostname
     
     if ($inspectionResult.NetworkInterception) {
@@ -380,7 +581,7 @@ function Test-NetworkEndpoint {
 
 # Main script execution
 try {
-    Write-LogMessage "Starting endpoint connectivity tests" "INFO"
+    Write-LogMessage "Starting enhanced endpoint connectivity tests" "INFO"
     Write-LogMessage "Log file: $LogPath" "INFO"
     
     # Load configuration
@@ -417,23 +618,48 @@ try {
         Name = "Endpoint"
         Expression = { $_.Endpoint }
     }, @{
+        Name = "Type"
+        Expression = { $_.EndpointType }
+    }, @{
         Name = "Status" 
         Expression = { $_.Status }
     }, @{
         Name = "TCP"
         Expression = { if ($_.TCPConnectivity) { "Pass" } else { "Fail" } }
     }, @{
+        Name = "SSL"
+        Expression = { if ($_.SSLHandshake) { "Pass" } else { "Fail" } }
+    }, @{
+        Name = "Service"
+        Expression = { if ($_.ServiceReachable) { "Pass" } else { "Fail" } }
+    }, @{
         Name = "PacketInspection"
         Expression = { if ($_.PacketInspectionDetected) { "DETECTED" } else { "None" } }
     }, @{
         Name = "InspectionTool"
         Expression = { $_.InspectionTool }
-    }, @{
-        Name = "FailureReason"
-        Expression = { $_.FailureReason }
     }
     
     $tableData | Format-Table -AutoSize
+    
+    # Detailed failure information
+    $failedEndpoints = $results | Where-Object { $_.Status -eq "FAIL" }
+    if ($failedEndpoints.Count -gt 0) {
+        Write-LogMessage "=== FAILURE DETAILS ===" "INFO"
+        foreach ($failed in $failedEndpoints) {
+            Write-LogMessage "Endpoint: $($failed.Endpoint)" "ERROR"
+            Write-LogMessage "  Reason: $($failed.FailureReason)" "ERROR"
+            if ($failed.StatusCode) {
+                Write-LogMessage "  HTTP Status: $($failed.StatusCode)" "ERROR"
+            }
+            if ($failed.InspectionDetails.Count -gt 0) {
+                Write-LogMessage "  Inspection Details:" "ERROR"
+                foreach ($detail in $failed.InspectionDetails) {
+                    Write-LogMessage "    - $detail" "ERROR"
+                }
+            }
+        }
+    }
     
     # Summary
     $passCount = ($results | Where-Object { $_.Status -eq "PASS" }).Count
