@@ -286,7 +286,8 @@ function Test-PacketInspection {
                 }
             }
             
-            # Check for known inspection tool headers
+            # Vendor-branded headers: these are injected by inspection/proxy products
+            # specifically when they are in the path, so they are reliable signals.
             $inspectionHeaders = @{
                 "X-Zscaler-" = "Zscaler"
                 "X-BlueCoat-" = "BlueCoat"
@@ -299,9 +300,17 @@ function Test-PacketInspection {
                 "X-Check-Point-" = "Check Point"
                 "X-Websense-" = "Websense"
                 "X-Cisco-" = "Cisco"
+            }
+
+            # Generic intermediary headers: standard HTTP headers added by ANY forward/
+            # reverse proxy, load balancer, or CDN (e.g. CloudFront, ipinfo.io's frontend).
+            # Their presence indicates an intermediary at the HTTP layer but does NOT mean
+            # the TLS tunnel was decrypted. TLS interception is caught by the certificate
+            # check above (issuer = a corporate/NGFW CA). We log these for visibility only.
+            $informationalHeaders = @{
                 "X-Proxy-" = "Generic Proxy"
                 "X-Forwarded-" = "Proxy/Load Balancer"
-                "Via" = "Proxy"
+                "Via" = "Proxy/CDN"
             }
             
             foreach ($header in $headers.AllKeys) {
@@ -310,8 +319,14 @@ function Test-PacketInspection {
                         $inspectionResult.SuspiciousHeaders = $true
                         $inspectionResult.NetworkInterception = $true
                         $inspectionResult.InspectionTool = $inspectionHeaders[$pattern]
-                        $inspectionResult.Details += "Suspicious header detected: $header"
+                        $inspectionResult.Details += "Inspection-tool header detected: $header"
                         Write-LogMessage "DETECTION: Inspection tool header found: $header" "WARN"
+                    }
+                }
+                foreach ($pattern in $informationalHeaders.Keys) {
+                    if ($header -match $pattern) {
+                        # Intermediary present (CDN/proxy/LB) but NOT treated as interception.
+                        Write-LogMessage "Intermediary header present (informational, not flagged): $header [$($informationalHeaders[$pattern])]" "INFO"
                     }
                 }
             }
@@ -571,7 +586,7 @@ try {
 
     $endpoints = New-Object System.Collections.Generic.List[string]
 
-    # General S3 reachability sanity checksbc
+    # General S3 reachability sanity checks
     $endpoints.Add("https://s3.amazonaws.com")
     $endpoints.Add("https://s3.$region.amazonaws.com")
 
@@ -579,7 +594,6 @@ try {
         # ----- SIA (Secure Infrastructure Access) connector outbound -----
         $endpoints.Add("https://$tenant.cyberark.cloud")                            # SIA backend / shared services
         $endpoints.Add("https://$tenant.dpa.cyberark.cloud")                        # SIA (DPA) backend
-        $endpoints.Add("https://$region.bc.be-privilege-access.cyberark.cloud")     # SIA backend (regional)
         if ($region -eq 'us-east-1') {
             $endpoints.Add("https://cms-assets-bucket-445444212982.s3.$region.amazonaws.com")          # SIA connector binaries (us-east-1 form)
         } else {
@@ -645,7 +659,7 @@ try {
     $tableData | Format-Table -AutoSize
     
     # Detailed failure information
-    $failedEndpoints = $results | Where-Object { $_.Status -eq "FAIL" }
+    $failedEndpoints = @($results | Where-Object { $_.Status -eq "FAIL" })
     if ($failedEndpoints.Count -gt 0) {
         Write-LogMessage "=== FAILURE DETAILS ===" "INFO"
         foreach ($failed in $failedEndpoints) {
@@ -654,7 +668,7 @@ try {
             if ($failed.StatusCode) {
                 Write-LogMessage "  HTTP Status: $($failed.StatusCode)" "ERROR"
             }
-            if ($failed.InspectionDetails.Count -gt 0) {
+            if (@($failed.InspectionDetails).Count -gt 0) {
                 Write-LogMessage "  Inspection Details:" "ERROR"
                 foreach ($detail in $failed.InspectionDetails) {
                     Write-LogMessage "    - $detail" "ERROR"
@@ -664,9 +678,9 @@ try {
     }
     
     # Summary
-    $passCount = ($results | Where-Object { $_.Status -eq "PASS" }).Count
-    $failCount = ($results | Where-Object { $_.Status -eq "FAIL" }).Count
-    $inspectionCount = ($results | Where-Object { $_.PacketInspectionDetected -eq $true }).Count
+    $passCount = @($results | Where-Object { $_.Status -eq "PASS" }).Count
+    $failCount = @($results | Where-Object { $_.Status -eq "FAIL" }).Count
+    $inspectionCount = @($results | Where-Object { $_.PacketInspectionDetected -eq $true }).Count
     
     Write-LogMessage "=== SUMMARY ===" "INFO"
     Write-LogMessage "Total Endpoints: $($results.Count)" "INFO"
