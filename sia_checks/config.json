@@ -1,4 +1,6 @@
 {
-    "tenant_name": "your-tenant-name",
-    "aws_region": "us-east-1"
+    "tenant_name": "your-subdomain",
+    "aws_region": "us-east-1",
+    "include_sia": true,
+    "include_connector_management": true
 }
