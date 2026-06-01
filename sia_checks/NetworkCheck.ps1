@@ -134,6 +134,9 @@ function Test-HTTPSConnectivity {
             "IoT" { 
                 $webRequest.Method = "GET"   # IoT endpoints expect GET
             }
+            "IPCheck" {
+                $webRequest.Method = "GET"   # Public-IP reporting services answer to GET
+            }
             default { 
                 $webRequest.Method = "HEAD"  # Default to HEAD for minimal impact
             }
@@ -144,91 +147,43 @@ function Test-HTTPSConnectivity {
             $result.HTTPSConnectivity = $true
             $result.StatusCode = $response.StatusCode
             $result.ResponseDetails = "HTTP Status: $($response.StatusCode)"
-            
-            # Validate response based on endpoint type
-            switch ($EndpointType) {
-                "S3" {
-                    # S3 should return 200 OK for valid HEAD requests to root
-                    # or may return other valid HTTP status codes
-                    if ($response.StatusCode -eq [System.Net.HttpStatusCode]::OK -or 
-                        $response.StatusCode -eq [System.Net.HttpStatusCode]::Forbidden -or
-                        $response.StatusCode -eq [System.Net.HttpStatusCode]::NotFound) {
-                        $result.ServiceReachable = $true
-                        Write-LogMessage "S3 endpoint reachable: $Hostname (Status: $($response.StatusCode))" "PASS"
-                    }
-                }
-                "CyberArk" {
-                    # CyberArk should return valid HTTP response
-                    if ($response.StatusCode -eq [System.Net.HttpStatusCode]::OK -or
-                        $response.StatusCode -eq [System.Net.HttpStatusCode]::Unauthorized -or
-                        $response.StatusCode -eq [System.Net.HttpStatusCode]::Forbidden) {
-                        $result.ServiceReachable = $true
-                        Write-LogMessage "CyberArk endpoint reachable: $Hostname (Status: $($response.StatusCode))" "PASS"
-                    }
-                }
-                "IoT" {
-                    # AWS IoT commonly returns 403 for unauthenticated requests - this is expected
-                    if ($response.StatusCode -eq [System.Net.HttpStatusCode]::OK -or 
-                        $response.StatusCode -eq [System.Net.HttpStatusCode]::Forbidden) {
-                        $result.ServiceReachable = $true
-                        Write-LogMessage "IoT endpoint reachable: $Hostname (Status: $($response.StatusCode))" "PASS"
-                    }
-                }
-                default {
-                    if ($response.StatusCode -eq [System.Net.HttpStatusCode]::OK) {
-                        $result.ServiceReachable = $true
-                        Write-LogMessage "Endpoint reachable: $Hostname (Status: $($response.StatusCode))" "PASS"
-                    }
-                }
-            }
-            
+
+            # Connectivity check: receiving ANY well-formed HTTP response means the
+            # endpoint was reached end-to-end through an intact TLS tunnel. The exact
+            # status code (200/403/404/405) reflects auth/method/path, not reachability.
+            # TLS/MITM interception is detected separately in Test-PacketInspection.
+            $result.ServiceReachable = $true
+            Write-LogMessage "$EndpointType endpoint reachable: $Hostname (Status: $($response.StatusCode))" "PASS"
+
             $response.Close()
         }
         catch [System.Net.WebException] {
             $webResponse = $_.Exception.Response
             if ($webResponse) {
+                # We received an HTTP response (even a 4xx/5xx), so the service was
+                # reached end-to-end. 403/404/405 are normal for unauthenticated,
+                # method-restricted, or root-path probes (e.g. HEAD https://s3.amazonaws.com
+                # returns 405; a GET against an IoT ATS root returns 404).
                 $statusCode = $webResponse.StatusCode
-                $result.HTTPSConnectivity = $true  # We got a response, even if error
+                $statusNumber = [int]$webResponse.StatusCode
+                $result.HTTPSConnectivity = $true
                 $result.StatusCode = $statusCode
-                $result.ResponseDetails = "HTTP Status: $statusCode"
-                
-                # Many services return error codes for unauthenticated requests - this is often expected
-                switch ($EndpointType) {
-                    "S3" {
-                        if ($statusCode -eq [System.Net.HttpStatusCode]::Forbidden -or
-                            $statusCode -eq [System.Net.HttpStatusCode]::NotFound -or
-                            $statusCode -eq [System.Net.HttpStatusCode]::BadRequest) {
-                            $result.ServiceReachable = $true
-                            Write-LogMessage "S3 endpoint reachable: $Hostname (Status: $statusCode - expected)" "PASS"
-                        }
-                    }
-                    "CyberArk" {
-                        if ($statusCode -eq [System.Net.HttpStatusCode]::Unauthorized -or
-                            $statusCode -eq [System.Net.HttpStatusCode]::Forbidden -or
-                            $statusCode -eq [System.Net.HttpStatusCode]::NotFound) {
-                            $result.ServiceReachable = $true
-                            Write-LogMessage "CyberArk endpoint reachable: $Hostname (Status: $statusCode - expected)" "PASS"
-                        }
-                    }
-                    "IoT" {
-                        if ($statusCode -eq [System.Net.HttpStatusCode]::Forbidden -or
-                            $statusCode -eq [System.Net.HttpStatusCode]::Unauthorized -or
-                            $statusCode -eq [System.Net.HttpStatusCode]::BadRequest) {
-                            $result.ServiceReachable = $true
-                            Write-LogMessage "IoT endpoint reachable: $Hostname (Status: $statusCode - expected)" "PASS"
-                        }
-                    }
+                $result.ResponseDetails = "HTTP Status: $statusCode ($statusNumber)"
+                $result.ServiceReachable = $true
+
+                if ($statusNumber -ge 500) {
+                    # Reachable, but a 5xx can indicate a broken upstream proxy/gateway.
+                    Write-LogMessage "$EndpointType endpoint reachable but returned server error: $Hostname (Status: $statusCode)" "WARN"
+                } else {
+                    Write-LogMessage "$EndpointType endpoint reachable: $Hostname (Status: $statusCode - expected for probe)" "PASS"
                 }
-                
-                if (-not $result.ServiceReachable) {
-                    $result.FailureReason = "Unexpected HTTP response: $statusCode"
-                    Write-LogMessage "Unexpected HTTP response from $Hostname`: $statusCode" "WARN"
-                }
-                
+
                 $webResponse.Close()
             }
             else {
-                $result.FailureReason = "HTTPS request failed: $($_.Exception.Message)"
+                # No response object => genuine connectivity failure
+                # (DNS failure, connection reset, blocked by firewall/proxy, or timeout).
+                $result.FailureReason = "HTTPS request failed (no response received): $($_.Exception.Message)"
                 Write-LogMessage "HTTPS request failed for $Hostname`: $($_.Exception.Message)" "FAIL"
             }
         }
@@ -480,7 +435,10 @@ function Get-SSLCertificate {
 function Get-EndpointType {
     param([string]$Hostname)
     
-    if ($Hostname -match '\.iot\..+\.amazonaws\.com$') {
+    if ($Hostname -match '^(api\.ipify\.org|ipinfo\.io|api\.my-ip\.io)$') {
+        return "IPCheck"
+    }
+    elseif ($Hostname -match '\.iot\..+\.amazonaws\.com$') {
         return "IoT"
     }
     elseif ($Hostname -match 's3.*\.amazonaws\.com$') {
@@ -594,13 +552,57 @@ try {
     Write-LogMessage "Tenant Name: $($config.tenant_name)" "INFO"
     Write-LogMessage "AWS Region: $($config.aws_region)" "INFO"
     
-    # Define endpoints to test
-    $endpoints = @(
-        "https://s3.amazonaws.com",
-        "https://s3.$($config.aws_region).amazonaws.com",
-        "https://$($config.tenant_name).cyberark.cloud",
-        "https://a2m4b3cupk8nzj-ats.iot.$($config.aws_region).amazonaws.com"
-    )
+    # Define endpoints to test.
+    #
+    # FQDNs are taken from CyberArk "Outbound traffic network and port requirements
+    # (General environment)" for SIA and Connector Management. <Region> and <subdomain>
+    # are substituted from config.json (aws_region / tenant_name, where tenant_name is the
+    # subdomain shown in your portal URL https://<subdomain>.cyberark.cloud). Toggle each
+    # group with include_sia / include_connector_management in config.json (default: both on).
+    #
+    # Region notes:
+    #   * component-registry-store bucket is always served from us-east-1.
+    #   * Milan (eu-south-1) and Israel (il-central-1) IoT is served from eu-central-1
+    #     (Frankfurt) - set aws_region accordingly if you deploy there.
+    #   * UAE (me-central-1) uses the regional S3 form (...s3.<region>.amazonaws.com) for the
+    #     Connector Management script/asset buckets instead of ...s3.amazonaws.com.
+    $region = $config.aws_region
+    $tenant = $config.tenant_name
+
+    $endpoints = New-Object System.Collections.Generic.List[string]
+
+    # General S3 reachability sanity checksbc
+    $endpoints.Add("https://s3.amazonaws.com")
+    $endpoints.Add("https://s3.$region.amazonaws.com")
+
+    if ($config.include_sia -ne $false) {
+        # ----- SIA (Secure Infrastructure Access) connector outbound -----
+        $endpoints.Add("https://$tenant.cyberark.cloud")                            # SIA backend / shared services
+        $endpoints.Add("https://$tenant.dpa.cyberark.cloud")                        # SIA (DPA) backend
+        $endpoints.Add("https://$region.bc.be-privilege-access.cyberark.cloud")     # SIA backend (regional)
+        if ($region -eq 'us-east-1') {
+            $endpoints.Add("https://cms-assets-bucket-445444212982.s3.$region.amazonaws.com")          # SIA connector binaries (us-east-1 form)
+        } else {
+            $endpoints.Add("https://cms-assets-bucket-445444212982-$region.s3.$region.amazonaws.com")  # SIA connector binaries (other regions)
+        }
+        $endpoints.Add("https://a2m4b3cupk8nzj-ats.iot.$region.amazonaws.com")      # SIA IoT broker (session events)
+    }
+
+    if ($config.include_connector_management -ne $false) {
+        # ----- Connector Management agent outbound -----
+        $endpoints.Add("https://$tenant.connectormanagement.cyberark.cloud")                          # CM REST APIs
+        $endpoints.Add("https://connector-management-scripts-490081306957-$region.s3.amazonaws.com")  # CM install scripts/logs
+        $endpoints.Add("https://connector-management-assets-490081306957-$region.s3.amazonaws.com")   # CM install assets/logs
+        $endpoints.Add("https://component-registry-store-490081306957.s3.amazonaws.com")              # CM component registry (always us-east-1)
+        $endpoints.Add("https://a3vvqcp8z371p3-ats.iot.$region.amazonaws.com")                        # CM IoT broker target
+        # Public-IP reporting - MUST be excluded from SSL inspection, or Secure Zone
+        # allowlist validation can fail.
+        $endpoints.Add("https://api.ipify.org")
+        $endpoints.Add("https://ipinfo.io")
+        $endpoints.Add("https://api.my-ip.io")
+    }
+
+    $endpoints = $endpoints.ToArray()
     
     # Test all endpoints
     $results = @()
