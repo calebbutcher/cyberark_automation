@@ -567,20 +567,6 @@ try {
     Write-LogMessage "Tenant Name: $($config.tenant_name)" "INFO"
     Write-LogMessage "AWS Region: $($config.aws_region)" "INFO"
     
-    # Define endpoints to test.
-    #
-    # FQDNs are taken from CyberArk "Outbound traffic network and port requirements
-    # (General environment)" for SIA and Connector Management. <Region> and <subdomain>
-    # are substituted from config.json (aws_region / tenant_name, where tenant_name is the
-    # subdomain shown in your portal URL https://<subdomain>.cyberark.cloud). Toggle each
-    # group with include_sia / include_connector_management in config.json (default: both on).
-    #
-    # Region notes:
-    #   * component-registry-store bucket is always served from us-east-1.
-    #   * Milan (eu-south-1) and Israel (il-central-1) IoT is served from eu-central-1
-    #     (Frankfurt) - set aws_region accordingly if you deploy there.
-    #   * UAE (me-central-1) uses the regional S3 form (...s3.<region>.amazonaws.com) for the
-    #     Connector Management script/asset buckets instead of ...s3.amazonaws.com.
     $region = $config.aws_region
     $tenant = $config.tenant_name
 
@@ -590,23 +576,29 @@ try {
     $endpoints.Add("https://s3.amazonaws.com")
     $endpoints.Add("https://s3.$region.amazonaws.com")
 
-    if ($config.include_sia -ne $false) {
+    if ($config.include_sia -eq $true) {
         # ----- SIA (Secure Infrastructure Access) connector outbound -----
         $endpoints.Add("https://$tenant.cyberark.cloud")                            # SIA backend / shared services
         $endpoints.Add("https://$tenant.dpa.cyberark.cloud")                        # SIA (DPA) backend
         if ($region -eq 'us-east-1') {
-            $endpoints.Add("https://cms-assets-bucket-445444212982.s3.$region.amazonaws.com")          # SIA connector binaries (us-east-1 form)
+            $endpoints.Add("https://cms-assets-bucket-445444212982.s3.$region.amazonaws.com")          # SIA connector binaries (us-east-1)
         } else {
             $endpoints.Add("https://cms-assets-bucket-445444212982-$region.s3.$region.amazonaws.com")  # SIA connector binaries (other regions)
         }
         $endpoints.Add("https://a2m4b3cupk8nzj-ats.iot.$region.amazonaws.com")      # SIA IoT broker (session events)
     }
 
-    if ($config.include_connector_management -ne $false) {
+    if ($config.include_connector_management -eq $true) {
         # ----- Connector Management agent outbound -----
-        $endpoints.Add("https://$tenant.connectormanagement.cyberark.cloud")                          # CM REST APIs
-        $endpoints.Add("https://connector-management-scripts-490081306957-$region.s3.amazonaws.com")  # CM install scripts/logs
-        $endpoints.Add("https://connector-management-assets-490081306957-$region.s3.amazonaws.com")   # CM install assets/logs
+        $endpoints.Add("https://$tenant.connectormanagement.cyberark.cloud")                                        # CM REST APIs
+        if ($region -eq 'me-central-1') {                                                                           # CM install files/logs for UAE region
+            $endpoints.Add("https://connector-management-scripts-490081306957-$region.s3.$region.amazonaws.com")
+            $endpoints.Add("https://connector-management-assets-490081306957-$region.s3.$region.amazonaws.com")
+        } else {                                                                                                    # CM install files/logs for all other regions
+            $endpoints.Add("https://connector-management-scripts-490081306957-$region.s3.amazonaws.com")  
+            $endpoints.Add("https://connector-management-assets-490081306957-$region.s3.amazonaws.com")   
+        }
+
         $endpoints.Add("https://component-registry-store-490081306957.s3.amazonaws.com")              # CM component registry (always us-east-1)
         $endpoints.Add("https://a3vvqcp8z371p3-ats.iot.$region.amazonaws.com")                        # CM IoT broker target
         # Public-IP reporting - MUST be excluded from SSL inspection, or Secure Zone

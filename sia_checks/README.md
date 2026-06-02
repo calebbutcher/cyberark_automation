@@ -24,7 +24,15 @@ The script validates connectivity to the following CyberArk and AWS services:
 1. **AWS S3 Global**: `https://s3.amazonaws.com`
 2. **AWS S3 Regional**: `https://s3.[region].amazonaws.com`
 3. **CyberArk Tenant**: `https://[tenant-name].cyberark.cloud`
-4. **AWS IoT Core**: `https://a2m4b3cupk8nzj-ats.iot.[region].amazonaws.com`
+4. **SIA IoT Broker**: `https://a2m4b3cupk8nzj-ats.iot.[region].amazonaws.com`
+5. **SIA Deployment Assets**: `https://cms-assets-bucket-445444212982.s3.[region].amazonaws.com` or `https://cms-assets-bucket-445444212982-[region].s3.[region].amazonaws.com`
+6. **SIA Backend**: `https://[tenant-name].dpa.cyberark.cloud`
+7. **Connector Management Backend**: `https://[tennant-name].connectormanagement.cyberark.cloud`
+8. **Connector Management Deployment Assets**: `https://connector-management-scripts-490081306957-[region].s3.amazonaws.com` and `https://connector-management-assets-490081306957-[region].s3.amazonaws.com`
+8.1. **Connector Management Deployment Assets** (UAE Region): `https://connector-management-scripts-490081306957-[region].s3.[region].amazonaws.com` and `https://connector-management-assets-490081306957-[region].s3.[region].amazonaws.com`
+9. **Connector Management Component Registry**: `https://component-registry-store-490081306957.s3.amazonaws.com`
+10. **IP Resolution Services**: `https://api.ipify.org`, `https://ipinfo.io`, `https://api.my-ip.io`
+
 
 ### Packet Inspection Detection
 
@@ -95,7 +103,9 @@ Before running the script, configure the `config.json` file with your CyberArk e
 ```json
 {
     "tenant_name": "your-tenant-name",
-    "aws_region": "us-east-1"
+    "aws_region": "us-east-1",
+    "include_sia": true,
+    "include_connector_management": true
 }
 ```
 
@@ -105,6 +115,9 @@ Before running the script, configure the `config.json` file with your CyberArk e
 |-----------|-------------|---------|
 | `tenant_name` | Your CyberArk SaaS tenant name (the subdomain in your CyberArk URL) | `"mycompany"` for `mycompany.cyberark.cloud` |
 | `aws_region` | AWS region where your CyberArk SaaS tenant is hosted | `"us-east-1"`, `"eu-west-1"`, `"ap-southeast-2"` |
+| `include_sia` | Whether to test SIA endpoints | `true`, `false` |
+| `include_connector_management` | Whether to test Connector Management endpoints | `true`, `false` |
+
 
 #### Finding Your Configuration Values
 
@@ -213,12 +226,22 @@ Using pip:
 After testing, both scripts display a comprehensive results table:
 
 ```
-Endpoint                                               | Status | TCP  | PacketInspection | InspectionTool | FailureReason
------------------------------------------------------- | ------ | ---- | ---------------- | -------------- | -------------
-https://s3.amazonaws.com                              | PASS   | Pass | None             | None           |              
-https://s3.us-east-1.amazonaws.com                    | PASS   | Pass | None             | None           |              
-https://mycompany.cyberark.cloud                      | PASS   | Pass | None             | None           |              
-https://a2m4b3cupk8nzj-ats.iot.us-east-1.amazonaws.com | PASS   | Pass | None             | None           |              
+Endpoint                                                                     Type     Status TCP  SSL  Service PacketInspection InspectionTool
+--------                                                                     ----     ------ ---  ---  ------- ---------------- --------------
+https://s3.amazonaws.com                                                     S3       PASS   Pass Pass Pass    None             None
+https://s3.us-east-1.amazonaws.com                                           S3       PASS   Pass Pass Pass    None             None
+https://mycompany.cyberark.cloud                                             CyberArk PASS   Pass Pass Pass    None             None
+https://mycompany.dpa.cyberark.cloud                                         CyberArk PASS   Pass Pass Pass    None             None
+https://cms-assets-bucket-445444212982.s3.us-east-1.amazonaws.com            S3       PASS   Pass Pass Pass    None             None
+https://a2m4b3cupk8nzj-ats.iot.us-east-1.amazonaws.com                       IoT      PASS   Pass Pass Pass    None             None
+https://mycompany.connectormanagement.cyberark.cloud                         CyberArk PASS   Pass Pass Pass    None             None
+https://connector-management-scripts-490081306957-us-east-1.s3.amazonaws.com S3       PASS   Pass Pass Pass    None             None
+https://connector-management-assets-490081306957-us-east-1.s3.amazonaws.com  S3       PASS   Pass Pass Pass    None             None
+https://component-registry-store-490081306957.s3.amazonaws.com               S3       PASS   Pass Pass Pass    None             None
+https://a3vvqcp8z371p3-ats.iot.us-east-1.amazonaws.com                       IoT      PASS   Pass Pass Pass    None             None
+https://api.ipify.org                                                        IPCheck  PASS   Pass Pass Pass    None             None
+https://ipinfo.io                                                            IPCheck  PASS   Pass Pass Pass    None             None
+https://api.my-ip.io                                                         IPCheck  PASS   Pass Pass Pass    None             None
 ```
 
 ### Log File
